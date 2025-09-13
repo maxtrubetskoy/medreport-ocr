@@ -1,0 +1,5 @@
+docx2pdf
+PyMuPDF
+requests
+Pillow
+python-docx
