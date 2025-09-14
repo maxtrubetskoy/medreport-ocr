@@ -11,10 +11,8 @@ from PIL import Image
 from docx2pdf import convert
 
 # --- Configuration ---
-TEXT_LLM_API_URL = "http://localhost:1234/v1/chat/completions"
 VISION_LLM_API_URL = "http://localhost:1234/v1/chat/completions"
-TEXT_MODEL_NAME = "gemma-3-9b-it"
-VISION_MODEL_NAME = "gemma-3-vision"
+VISION_MODEL_NAME = "google/gemma-3-12b"
 
 # --- File Processing ---
 def get_docx_files(directory):
@@ -41,13 +39,26 @@ def pdf_to_images(filepath):
     """Converts each page of a PDF into a PIL Image."""
     try:
         doc = pymupdf.open(filepath)
-        images = [page.get_pixmap(dpi=300).to_pil() for page in doc]
+        images = [page.get_pixmap(dpi=500).pil_image() for page in doc]
+        images = [im.resize((im.size[0]*2, im.size[1]*2), 3) for im in images]
         doc.close()
         return images
     except Exception as e:
         print(f"  - Error processing PDF file {os.path.basename(filepath)}: {e}")
         return []
-
+    
+def pdf_to_text(filepath):
+    """Extracts text from pdf directly using PyMuPDF. Needs fallback to OCR when the document contains screenshots of text isntead of a text"""
+    try:
+        doc = pymupdf.open(filepath)
+        text = ""
+        for page in range(doc.page_count):
+            text += doc.get_page_text(page)
+        return text
+    except Exception as e:
+        print(f"  - Error processing PDF file {os.path.basename(filepath)}: {e}")
+        return ""
+    
 def image_to_base64(image, format="jpeg"):
     """Converts a PIL image to a base64 encoded string."""
     buffered = io.BytesIO()
@@ -55,17 +66,17 @@ def image_to_base64(image, format="jpeg"):
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 # --- LLM Interaction ---
-def call_text_llm(messages, temperature=0.5):
+def call_text_llm(messages, temperature=0.1):
     """Generic function to call the LM Studio Text API."""
     headers = {"Content-Type": "application/json"}
     payload = {
-        "model": TEXT_MODEL_NAME,
+        "model": VISION_MODEL_NAME,
         "messages": messages,
         "temperature": temperature,
-        "response_format": {"type": "json_object"},
+        # "response_format": {"type": "json_object"},
     }
     try:
-        response = requests.post(TEXT_LLM_API_URL, headers=headers, json=payload, timeout=180)
+        response = requests.post(VISION_LLM_API_URL, headers=headers, json=payload, timeout=180)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
     except requests.exceptions.RequestException as e:
@@ -83,12 +94,12 @@ def ocr_image_with_vision_llm(image):
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Extract all text from this image of a medical report page."},
+                    {"type": "text", "text": "Extract all text from this image of a medical report page. Do not translate anything (content will be primarily in Russian), do not output any extra text - only what you see from the image."},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]
             }
         ],
-        "max_tokens": 2048,
+        "max_tokens": 32000,
     }
 
     try:
@@ -102,6 +113,7 @@ def ocr_image_with_vision_llm(image):
 def parse_llm_json_output(text):
     """Parses the LLM output that should be a JSON object."""
     try:
+        text = text.replace("json", "").replace("```", "")
         return json.loads(text)
     except json.JSONDecodeError:
         print("  - Failed to parse LLM output as JSON. Received:", text)
@@ -121,7 +133,9 @@ The output must be a single, well-formed JSON object with this structure:
   "gender": "...",
   "captions_ru": {{
     "organ_name_1": "description in Russian...",
-    "organ_name_2": "description in Russian..."
+    "organ_name_2": "description in Russian...",
+    ...
+    "conclusion": "conclusion extracted from the text"
   }}
 }}
 
@@ -130,7 +144,7 @@ Report Text:
 {text}
 ---
 """
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": [{"type": "text", "text": prompt}]}]
     response_text = call_text_llm(messages)
     return parse_llm_json_output(response_text) if response_text else None
 
@@ -154,6 +168,7 @@ def main():
     parser = argparse.ArgumentParser(description="Medical Report Translation Pipeline (MRTP)")
     parser.add_argument("--input-dir", type=str, required=True, help="Input directory containing .docx files.")
     parser.add_argument("--output-file", type=str, required=True, help="Output JSON file path.")
+    parser.add_argument("--force-ocr", type=bool, required=False, default=False, help="Use OCR to extract textual data?")
     args = parser.parse_args()
 
     docx_files = get_docx_files(args.input_dir)
@@ -171,21 +186,38 @@ def main():
             print(f"  - Skipping {os.path.basename(docx_file)} due to conversion failure.")
             continue
 
-        images = pdf_to_images(temp_pdf)
+
+        if args.force_ocr:
+            images = pdf_to_images(temp_pdf)
+
+            if not images:
+                print(f"  - Could not extract images from the converted PDF. Skipping.")
+                continue
+
+            print(f"  - Extracted {len(images)} page(s). Performing OCR...")
+            full_ocr_text = ""
+            for i, image in enumerate(images):
+                print(f"    - Processing page {i+1}/{len(images)}...")
+                ocr_text = ocr_image_with_vision_llm(image)
+                if ocr_text:
+                    full_ocr_text += ocr_text + "\n\n"
+        else:
+            full_ocr_text = pdf_to_text(temp_pdf)
+            if len(full_ocr_text) < 50:
+                images = pdf_to_images(temp_pdf)
+                
+                if not images:
+                    print(f"  - Could not extract images from the converted PDF. Skipping.")
+                    continue
+
+                print(f"  - Extracted {len(images)} page(s). Performing OCR...")
+                for i, image in enumerate(images):
+                    print(f"    - Processing page {i+1}/{len(images)}...")
+                    ocr_text = ocr_image_with_vision_llm(image)
+                    if ocr_text:
+                        full_ocr_text += ocr_text + "\n\n"
+                
         os.remove(temp_pdf)
-
-        if not images:
-            print(f"  - Could not extract images from the converted PDF. Skipping.")
-            continue
-
-        print(f"  - Extracted {len(images)} page(s). Performing OCR...")
-        full_ocr_text = ""
-        for i, image in enumerate(images):
-            print(f"    - Processing page {i+1}/{len(images)}...")
-            ocr_text = ocr_image_with_vision_llm(image)
-            if ocr_text:
-                full_ocr_text += ocr_text + "\n\n"
-
         if not full_ocr_text.strip():
             print(f"  - No text could be extracted. Skipping.")
             continue
