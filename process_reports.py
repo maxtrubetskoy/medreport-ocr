@@ -123,7 +123,7 @@ def extract_structured_ru_data(text):
     """Extracts patient info and organ descriptions from OCR'd Russian text."""
     system_prompt = "You are a data extraction assistant. Extract patient information and organ descriptions from the provided medical report text. Output a single JSON object."
     prompt = f"""
-Please extract the patient information (patient_group, patient_id, age, gender) and the descriptions for each organ from the following Russian medical report text.
+Please extract the patient information (patient_group, patient_id, age, gender) and the descriptions for each organ from the following Russian medical report text. Translate the organ names into English, output everything else in the language of original.
 
 The output must be a single, well-formed JSON object with this structure:
 {{
@@ -150,9 +150,22 @@ Report Text:
 
 def translate_captions(captions, target_language):
     """Translates a dictionary of captions to the target language."""
-    system_prompt = f"You are an expert medical translator. Translate the provided JSON values from Russian to {target_language}. Preserve the JSON structure and keys. Do not add any commentary."
+    system_prompt = f"You are an expert medical translator. Translate the provided JSON values from Russian to {target_language}. Preserve the JSON structure, do not change the keys. Do not add any commentary."
     prompt = f"""
 Translate the values in the following JSON object to {target_language}.
+Return a single JSON object with the same keys.
+
+Input:
+{json.dumps(captions, ensure_ascii=False, indent=2)}
+"""
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+    response_text = call_text_llm(messages)
+    return parse_llm_json_output(response_text) if response_text else None
+
+def extract_one_hot_labels(captions):
+    """Translates a dictionary of captions to the target language."""
+    system_prompt = f"You are an expert medical professional. Read the provided JSON values that indicate the health assessment of the organs. Preserve the JSON structure, but instead of text, set the value to 1 if the organ is diseased, or 0 if it is healthy. Do not add any commentary."
+    prompt = f""".
 Return a single JSON object with the same keys.
 
 Input:
@@ -241,16 +254,23 @@ def main():
         if not captions_kz:
             print(f"  - Failed to translate to Kazakh. Skipping.")
             continue
-
+        
+        print("  - Extracting the labels...")
+        labels = extract_one_hot_labels(captions_en)
+        if not labels:
+            print(f"  - Failed to extract labels. Skipping.")
+            continue
+        
         final_report = {
             "source_file": os.path.basename(docx_file),
-            "patient_group": structured_data.get("patient_group", "N/A"),
-            "patient_id": structured_data.get("patient_id", "N/A"),
+            "patient_group": args.input_dir.split('\\')[-2],
+            "patient_id": os.path.basename(docx_file).split(".txt")[0],
             "age": structured_data.get("age", "N/A"),
             "gender": structured_data.get("gender", "N/A"),
             "captions_ru": captions_ru,
             "captions_en": captions_en,
             "captions_kz": captions_kz,
+            "labels": labels
         }
         all_report_data.append(final_report)
         print(f"  - Successfully processed {os.path.basename(docx_file)}.")
